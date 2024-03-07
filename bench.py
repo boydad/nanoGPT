@@ -67,7 +67,7 @@ else:
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=50304, dropout=dropout)
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
 if ddp:
