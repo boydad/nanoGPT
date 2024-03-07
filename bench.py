@@ -7,13 +7,21 @@ import numpy as np
 import time
 import torch
 from model import GPTConfig, GPT
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+
 
 # -----------------------------------------------------------------------------
 batch_size = 12
-block_size = 1024
+block_size = 1024 # how far back does the model look? i.e. context size
+n_layer = 12
+n_head = 12
+n_embd = 768
+dropout=False
 bias = False
 real_data = True
 seed = 1337
+backend = 'nccl'
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
@@ -28,6 +36,14 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    init_process_group(backend=backend)
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
 
 # data loading init
 if real_data:
@@ -47,14 +63,15 @@ else:
     y = torch.randint(50304, (batch_size, block_size), device=device)
     get_batch = lambda split: (x, y)
 
+
+
 # model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 model.to(device)
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
@@ -115,3 +132,6 @@ else:
         mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
         if stage == 1:
             print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+
+if ddp:
+    destroy_process_group()
