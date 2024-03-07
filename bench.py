@@ -70,9 +70,10 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   bias=bias, vocab_size=50304, dropout=dropout)
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
+model.to(device)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-model.to(device)
+
 
 optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
 
