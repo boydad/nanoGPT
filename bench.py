@@ -151,7 +151,7 @@ else:
         tpi = dt/num_steps
         print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, MFU: {mfu*100:.2f}%")
 
-        if wandb_log:
+        if wandb_log and master_process:
             wandb.log({
                 "time_per_iteration": tpi,
                 "mfu": mfu*100, # convert to percentage
