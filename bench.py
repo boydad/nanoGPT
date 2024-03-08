@@ -155,6 +155,7 @@ else:
             wandb.log({
                 "time_per_iteration": tpi,
                 "mfu": mfu*100, # convert to percentage
+                "loss":lossf
             })
 
 if ddp:
