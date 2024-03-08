@@ -52,7 +52,7 @@ if ddp:
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-master_process = os.environ.get('RANK', 0) == 0
+master_process = os.environ.get('RANK', 0) == '0'
 
 # data loading init
 if real_data:
