@@ -26,7 +26,15 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
 profile = False # use pytorch profiler, or just simple benchmarking?
+# wandb logging
+wandb_log = False # disabled by default
+wandb_project = 'benchmark'
+wandb_run_name = 'run' + str(time.time())
+# -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.dirname(__file__)+'/configurator.py').read()) # overrides from command line or config file
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -44,6 +52,7 @@ if ddp:
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
+master_process = os.environ.get('RANK', 0) == 0
 
 # data loading init
 if real_data:
@@ -78,6 +87,12 @@ optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, be
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # unwrap DDP container if needed
+
+# logging
+if wandb_log and master_process:
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
 
 if compile:
     print("Compiling model...")
@@ -117,7 +132,7 @@ else:
 
     # simple benchmarking
     torch.cuda.synchronize()
-    for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
+    for stage, num_steps in enumerate([10] * 5): # burnin, then benchmark
         t0 = time.time()
         X, Y = get_batch('train')
         for k in range(num_steps):
@@ -133,8 +148,14 @@ else:
         t1 = time.time()
         dt = t1-t0
         mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt)
-        if stage == 1:
-            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+        tpi = dt/num_steps
+        print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+
+        if wandb_log:
+            wandb.log({
+                "time_per_iteration": tpi,
+                "mfu": mfu*100, # convert to percentage
+            })
 
 if ddp:
     destroy_process_group()
