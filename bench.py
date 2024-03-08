@@ -77,6 +77,7 @@ optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, be
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # unwrap DDP container if needed
 
 if compile:
     print("Compiling model...")
@@ -131,7 +132,7 @@ else:
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1-t0
-        mfu = model.module.estimate_mfu(batch_size * 1 * num_steps, dt)
+        mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt)
         if stage == 1:
             print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
 
