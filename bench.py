@@ -25,7 +25,7 @@ backend = 'nccl'
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = True # use PyTorch 2.0 to compile the model to be faster
-profile = False # use pytorch profiler, or just simple benchmarking?
+profile = 'no' # "torch" or "cuda" profile or anything else - simple benchmark
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'benchmark'
@@ -98,12 +98,40 @@ if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
 
-if profile:
+def core_banch(stage, num_steps):
+    torch.cuda.synchronize()
+    t0 = time.time()
+    X, Y = get_batch('train')
+    for k in range(num_steps):
+        with ctx:
+            logits, loss = model(X, Y)
+        X, Y = get_batch('train')
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        lossf = loss.item()
+        print(f"{k}/{num_steps} loss: {lossf:.4f}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = t1-t0
+    mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt)
+    tpi = dt/num_steps
+    print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+
+    if wandb_log and master_process:
+        wandb.log({
+            "time_per_iteration": tpi,
+            "mfu": mfu*100, # convert to percentage
+            "loss":lossf
+        })
+
+
+if profile == "torch":
     # useful docs on pytorch profiler:
     # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
     # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
-    wait, warmup, active = 5, 5, 5
-    num_steps = wait + warmup + active
+    wait, warmup, active = 1, 1, 3
+    num_stages = wait + warmup + active
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
@@ -114,49 +142,17 @@ if profile:
         with_flops=True,
         with_modules=False, # only for torchscript models atm
     ) as prof:
-
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-
+        for stage, num_steps in enumerate([10] * num_stages):
+            core_banch(0, num_steps)
             prof.step() # notify the profiler at end of each step
-
+elif profile == "cuda":
+    with torch.cuda.profiler.profile():
+        with torch.autograd.profiler.emit_nvtx():
+            for stage, num_steps in enumerate([4, 10]): # burnin, then benchmark
+                core_banch(stage, num_steps)
 else:
-
-    # simple benchmarking
-    torch.cuda.synchronize()
     for stage, num_steps in enumerate([10] * 5): # burnin, then benchmark
-        t0 = time.time()
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1-t0
-        mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt)
-        tpi = dt/num_steps
-        print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, MFU: {mfu*100:.2f}%")
-
-        if wandb_log and master_process:
-            wandb.log({
-                "time_per_iteration": tpi,
-                "mfu": mfu*100, # convert to percentage
-                "loss":lossf
-            })
+        core_banch(stage, num_steps)
 
 if ddp:
     destroy_process_group()
