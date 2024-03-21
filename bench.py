@@ -90,9 +90,8 @@ if fsdp:
     model = FSDP(model,
         device_id=torch.cuda.current_device(),
         auto_wrap_policy=functools.partial(_wrap_module_cls_individually,
-            module_classes={Block,},#)
+            module_classes={Block,}), #)
         use_orig_params=True)
-    )
 
 print("TMP", raw_model.get_num_params(), Nparams)
 
