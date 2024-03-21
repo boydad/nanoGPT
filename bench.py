@@ -5,14 +5,29 @@ import os
 from contextlib import nullcontext
 import numpy as np
 import time
+import functools
 import torch
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, Block
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+from torch.distributed.fsdp.wrap import (
+    _wrap_module_cls_individually
+)
+
+
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    CPUOffload,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    FullStateDictConfig,
+    StateDictType,
+)
 
 # -----------------------------------------------------------------------------
-batch_size = 12
+batch_size = 1
 block_size = 1024 # how far back does the model look? i.e. context size
 n_layer = 12
 n_head = 12
@@ -27,6 +42,8 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 profile = 'no' # "torch" or "cuda" profile or anything else - simple benchmark
 # wandb logging
+ddp = True
+fsdp = False
 wandb_log = False # disabled by default
 wandb_project = 'benchmark'
 wandb_run_name = 'run' + str(time.time())
@@ -45,14 +62,51 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+# model init on CPU for fsdp
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=50304, dropout=dropout)
+gptconf = GPTConfig(**model_args)
+model = GPT(gptconf)
+Nparams = model.get_num_params()
 
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
+print(f'Memory 1: {torch.cuda.memory_allocated()/1024/1024/1024} Gb, {torch.cuda.memory_reserved()/1024**3} Gb')
+
+
+if ddp or fsdp:
+    assert int(os.environ.get('RANK', -1)) != -1, "Not run with MPI"
     init_process_group(backend=backend)
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(ddp_local_rank)
+    # device = f'{device}:{ddp_local_rank}'
 master_process = os.environ.get('RANK', 0) == '0'
+
+if not fsdp:
+    model.to(device)
+if ddp:
+    model = DDP(model, gradient_as_bucket_view=True)
+
+raw_model = model.module if ddp else model
+if fsdp:
+    model = FSDP(model,
+        device_id=torch.cuda.current_device(),
+        auto_wrap_policy=functools.partial(_wrap_module_cls_individually,
+            module_classes={Block,},#)
+        use_orig_params=True)
+    )
+
+print("TMP", raw_model.get_num_params(), Nparams)
+
+print(f'Memory 2: {torch.cuda.memory_allocated()/1024/1024/1024} Gb, {torch.cuda.memory_reserved()/1024**3} Gb')
+
+
+if compile:
+    print("Compiling model...")
+    model = torch.compile(model) # pytorch 2.0
+
+# print(model)
+
+optimizer = raw_model.configure_optimizers(model, weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
+
 
 # data loading init
 if real_data:
@@ -73,32 +127,14 @@ else:
     get_batch = lambda split: (x, y)
 
 
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=50304, dropout=dropout)
-gptconf = GPTConfig(**model_args)
-model = GPT(gptconf)
-model.to(device)
-
-optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
-
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-
 # logging
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 
-if compile:
-    print("Compiling model...")
-    model = torch.compile(model) # pytorch 2.0
 
-def core_banch(stage, num_steps):
+def core_bench(stage, num_steps):
     torch.cuda.synchronize()
     t0 = time.time()
     X, Y = get_batch('train')
@@ -114,9 +150,11 @@ def core_banch(stage, num_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1-t0
-    mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt)
+    mfu = raw_model.estimate_mfu(batch_size * 1 * num_steps, dt, N=Nparams)
     tpi = dt/num_steps
-    print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+    m = torch.cuda.memory_allocated()/1024/1024/1024
+    print(f"state = {stage}, loss: {lossf:.4f}, time per iteration: {tpi*1000:.4f}ms, "
+        f"MFU: {mfu*100:.2f}%, MeM: {m} Gb, {torch.cuda.memory_reserved()/1024**3} Gb")
 
     if wandb_log and master_process:
         wandb.log({
@@ -125,6 +163,7 @@ def core_banch(stage, num_steps):
             "loss":lossf
         })
 
+print(f'Memory 3: {torch.cuda.memory_allocated()/1024**3} Gb, {torch.cuda.memory_reserved()/1024**3} Gb')
 
 if profile == "torch":
     # useful docs on pytorch profiler:
@@ -143,16 +182,18 @@ if profile == "torch":
         with_modules=False, # only for torchscript models atm
     ) as prof:
         for stage, num_steps in enumerate([10] * num_stages):
-            core_banch(0, num_steps)
+            core_bench(0, num_steps)
             prof.step() # notify the profiler at end of each step
 elif profile == "cuda":
     with torch.cuda.profiler.profile():
         with torch.autograd.profiler.emit_nvtx():
             for stage, num_steps in enumerate([4, 10]): # burnin, then benchmark
-                core_banch(stage, num_steps)
+                core_bench(stage, num_steps)
+
+
 else:
-    for stage, num_steps in enumerate([10] * 5): # burnin, then benchmark
-        core_banch(stage, num_steps)
+    for stage, num_steps in enumerate([2] * 5): # burnin, then benchmark
+        core_bench(stage, num_steps)
 
 if ddp:
     destroy_process_group()

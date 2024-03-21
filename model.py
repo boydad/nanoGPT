@@ -260,9 +260,10 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    @staticmethod
+    def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in model.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
@@ -286,11 +287,12 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter, dt, *, N=None):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
+        # for FSDP model instance does not have all parameters so we compute it at init and send it here
+        N = self.get_num_params() if N is None else N
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
         flops_per_token = 6*N + 12*L*H*Q*T
